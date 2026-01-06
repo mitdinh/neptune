@@ -4,3 +4,16 @@ __pycache__/
 .env
 .DS_Store
 toolbox
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets
+.env
+service-account.json
+
+# Binary
+toolbox
+*.code-workspace
