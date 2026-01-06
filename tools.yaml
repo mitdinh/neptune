@@ -1,0 +1,191 @@
+sources:
+  insurance-bq:
+    kind: bigquery
+    project: summestorm-1754711636
+    location: us-east4
+
+tools:
+
+  # =====================================================
+  # 1) EXISTING TOOL (kept)
+  # NOTE: This may still FAIL at runtime if AI.EMBED / VECTOR_SEARCH
+  #       are not available in your BigQuery environment.
+  # =====================================================
+  search_policy_db:
+    kind: bigquery-sql
+    source: insurance-bq
+    description: |
+      Retrieve the most relevant policy chunk for a given query, product, and insurer.
+      First filters to the correct doc_id in metadata, then performs vector search.
+      Returns the single best matching chunk with distance plus metadata.
+    parameters:
+      - name: query
+        type: string
+        description: The user's question/topic (e.g., "flood cover", "excess fees").
+      - name: product
+        type: string
+        description: Policy type (e.g., business, cyber, strata, management_liability).
+      - name: insurer
+        type: string
+        description: Insurer id (e.g., aami, allianz).
+    statement: |
+      SELECT
+        base.text AS text,
+        distance AS distance,
+        base.metadata.doc_id AS doc_id,
+        base.metadata.product AS product,
+        base.metadata.insurer AS insurer,
+        base.metadata.source_md AS source_md,
+        base.metadata.headers.h1 AS h1,
+        base.metadata.section_index AS section_index,
+        base.metadata.paragraph_index AS paragraph_index
+      FROM VECTOR_SEARCH(
+        (SELECT *
+         FROM `summestorm-1754711636.rag_pds.children`
+         WHERE metadata.doc_id = CONCAT(LOWER(@product), '_', LOWER(@insurer))),
+        'embedding',
+        (SELECT AI.EMBED(
+            @query,
+            connection_id => 'us-east4.rag_vertex_conn',
+            endpoint => 'text-embedding-005'
+        ).result AS embedding),
+        top_k => 1
+      )
+      LIMIT 1;
+
+  # =====================================================
+  # 2) PERMISSION TEST TOOL (SAFE, READ-ONLY)
+  # =====================================================
+  perm_test_rag_pds:
+    kind: bigquery-sql
+    source: insurance-bq
+    description: |
+      Permission test for MCP Toolbox.
+      Verifies the service account can read rag_pds.chunks.
+    statement: |
+      SELECT 1
+      FROM `summestorm-1754711636.rag_pds.chunks`
+      LIMIT 1;
+
+  # =====================================================
+  # 3) KEYWORD SEARCH ON rag_pds.chunks (FAST)
+  # Updated to match your MAIN SQL logic:
+  # - Match keywords against heading123_lc and combined
+  # - Optional regex; use "" for none
+  # =====================================================
+  search_chunks_keyword:
+    kind: bigquery-sql
+    source: insurance-bq
+    description: |
+      Read-only keyword filter over rag_pds.chunks.
+      Uses optional filters (doc_id/product_id/insurer_id/scope) and a regex.
+      Matches against heading123_lc and combined (like your main SQL).
+      Returns JSON lines ordered by insurer_id, doc_id, and child_id ordinal suffix.
+    parameters:
+      - name: doc_id
+        type: string
+        description: Optional exact doc_id (e.g., "cyber.blue_zebra"). Use "" for none.
+      - name: product_id
+        type: string
+        description: Optional product_id. Use "" for none.
+      - name: insurer_id
+        type: string
+        description: Optional insurer_id. Use "" for none.
+      - name: scope
+        type: string
+        description: Optional scope substring. Use "" for none.
+      - name: keyword_regex
+        type: string
+        description: Optional regex like "(defence costs|defense costs|legal costs)". Use "" for none.
+      - name: limit_n
+        type: integer
+        description: Max rows to return (e.g. 200). Must be an integer (e.g. 50).
+    statement: |
+      SELECT
+        TO_JSON_STRING(STRUCT(
+          doc_id, product_id, insurer_id, child_id, scope,
+          heading1, heading2, heading3, text, url
+        )) AS json
+      FROM `summestorm-1754711636.rag_pds.chunks`
+      WHERE (@doc_id = '' OR doc_id = @doc_id)
+        AND (@product_id = '' OR product_id = @product_id)
+        AND (@insurer_id = '' OR insurer_id = @insurer_id)
+        AND (
+          @scope = ''
+          OR (scope IS NOT NULL AND STRPOS(LOWER(scope), LOWER(@scope)) > 0)
+        )
+        AND (
+          @keyword_regex = ''
+          OR REGEXP_CONTAINS(COALESCE(heading123_lc, ''), @keyword_regex)
+          OR REGEXP_CONTAINS(LOWER(COALESCE(combined, '')), @keyword_regex)
+        )
+      ORDER BY
+        insurer_id, doc_id,
+        SAFE_CAST(REGEXP_EXTRACT(child_id, r'_(\d+)$') AS INT64)
+      LIMIT @limit_n;
+
+  # =====================================================
+  # 4) CONTEXT EXPAND AROUND ANCHOR child_id (READ-ONLY)
+  # =====================================================
+  fetch_context_by_anchor:
+    kind: bigquery-sql
+    source: insurance-bq
+    description: |
+      Given an anchor child_id, fetch related chunks using heading2/heading1
+      or a scope-based ord window. Read-only.
+    parameters:
+      - name: anchor_child_id
+        type: string
+        description: The anchor child_id to expand from.
+      - name: mode
+        type: string
+        description: 'One of: heading2, heading1, scope_window.'
+      - name: window
+        type: integer
+        description: Only used for scope_window (e.g. 6).
+      - name: limit_n
+        type: integer
+        description: Safety cap (e.g. 120).
+    statement: |
+      WITH a AS (
+        SELECT
+          doc_id, scope, heading1, heading2,
+          SAFE_CAST(REGEXP_EXTRACT(child_id, r'_(\d+)$') AS INT64) AS ord
+        FROM `summestorm-1754711636.rag_pds.chunks`
+        WHERE child_id = @anchor_child_id
+        LIMIT 1
+      )
+      SELECT
+        TO_JSON_STRING(STRUCT(
+          c.doc_id, c.product_id, c.insurer_id, c.child_id, c.scope,
+          c.heading1, c.heading2, c.heading3, c.text, c.url
+        )) AS json
+      FROM `summestorm-1754711636.rag_pds.chunks` c
+      JOIN a ON c.doc_id = a.doc_id
+      WHERE (
+        (@mode = 'heading2'
+          AND a.heading2 IS NOT NULL AND a.heading2 != ''
+          AND c.heading1 = a.heading1 AND c.heading2 = a.heading2)
+        OR
+        (@mode = 'heading1'
+          AND a.heading1 IS NOT NULL AND a.heading1 != ''
+          AND c.heading1 = a.heading1)
+        OR
+        (@mode = 'scope_window'
+          AND a.scope IS NOT NULL AND a.scope != ''
+          AND c.scope = a.scope
+          AND SAFE_CAST(REGEXP_EXTRACT(c.child_id, r'_(\d+)$') AS INT64)
+              BETWEEN a.ord - @window AND a.ord + @window)
+      )
+      ORDER BY SAFE_CAST(REGEXP_EXTRACT(c.child_id, r'_(\d+)$') AS INT64)
+      LIMIT @limit_n;
+
+toolsets:
+  insurance_pds_toolset:
+    - search_policy_db
+    - perm_test_rag_pds
+
+  chunks_keyword_toolset:
+    - perm_test_rag_pds
+    - search_chunks_keyword
+    - fetch_context_by_anchor
